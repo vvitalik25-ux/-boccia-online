@@ -57,6 +57,13 @@ export class BocciaRoom extends DurableObject {
     );
   }
 
+  expectedSide(state) {
+    const phase = state?.phase;
+    if (phase === "jackRed" || phase === "red") return "red";
+    if (phase === "jackBlue" || phase === "blue") return "blue";
+    return null;
+  }
+
   async fetch() {
     // A player is connecting/reconnecting, so keep this room alive.
     await this.ctx.storage.deleteAlarm();
@@ -126,6 +133,8 @@ export class BocciaRoom extends DurableObject {
           type: "joined",
           playerId: player.id,
           side: player.side,
+          revision: Number((await this.ctx.storage.get("turnRevision")) || 0),
+          activeThrow: (await this.ctx.storage.get("activeThrow")) || null,
           state: savedState || null,
         })
       );
@@ -148,17 +157,90 @@ export class BocciaRoom extends DurableObject {
     }
 
     if (data.type === "game_start" && data.state) {
-      const initialRevision = Math.max(1, Number(data.state.turnRevision) || 1);
-      const initialState = { ...data.state, turnRevision: initialRevision };
+      // Only red starts a fresh room. Duplicate starts are harmless.
+      const existingState = await this.ctx.storage.get("gameState");
+      const existingRevision = Number(
+        (await this.ctx.storage.get("turnRevision")) || 0
+      );
+
+      if (existingState) {
+        ws.send(JSON.stringify({
+          type: "state_reply",
+          revision: existingRevision,
+          state: existingState,
+          activeThrow: (await this.ctx.storage.get("activeThrow")) || null,
+        }));
+        return;
+      }
+
+      if (player.side !== "red") return;
+
+      const initialRevision = 1;
+      const initialState = {
+        ...data.state,
+        turnRevision: initialRevision,
+      };
+
       await this.ctx.storage.put("gameState", initialState);
       await this.ctx.storage.put("turnRevision", initialRevision);
+      await this.ctx.storage.delete("activeThrow");
+      await this.ctx.storage.delete("lastCommitId");
 
       this.broadcast({
-        ...data,
+        type: "game_start",
         state: initialState,
+        revision: initialRevision,
         side: player.side,
         playerId: player.id,
       });
+      return;
+    }
+
+    if (data.type === "throw") {
+      const currentRevision = Number(
+        (await this.ctx.storage.get("turnRevision")) || 0
+      );
+      const currentState =
+        (await this.ctx.storage.get("gameState")) || null;
+      const activeThrow =
+        (await this.ctx.storage.get("activeThrow")) || null;
+      const expected = this.expectedSide(currentState);
+      const baseRevision = Number(data.baseRevision) || 0;
+
+      if (
+        !data.throwId ||
+        activeThrow ||
+        baseRevision !== currentRevision ||
+        (expected && expected !== player.side)
+      ) {
+        ws.send(JSON.stringify({
+          type: "throw_rejected",
+          revision: currentRevision,
+          state: currentState,
+        }));
+        return;
+      }
+
+      const throwInfo = {
+        throwId: String(data.throwId),
+        playerId: player.id,
+        side: player.side,
+        baseRevision: currentRevision,
+        kind: data.kind || null,
+        startedAt: Date.now(),
+      };
+
+      await this.ctx.storage.put("activeThrow", throwInfo);
+
+      // The opponent receives only "a throw is happening". No coordinates.
+      this.broadcast({
+        type: "throw",
+        throwId: throwInfo.throwId,
+        baseRevision: currentRevision,
+        kind: throwInfo.kind,
+        side: player.side,
+        playerId: player.id,
+      }, ws);
       return;
     }
 
@@ -168,11 +250,12 @@ export class BocciaRoom extends DurableObject {
       );
       const currentState =
         (await this.ctx.storage.get("gameState")) || null;
+      const activeThrow =
+        (await this.ctx.storage.get("activeThrow")) || null;
       const lastCommitId =
         (await this.ctx.storage.get("lastCommitId")) || null;
 
-      // Retry of an already accepted commit: acknowledge it again,
-      // but never advance the revision twice.
+      // Idempotency: the same commit may be retried any number of times.
       if (lastCommitId === data.commitId) {
         ws.send(JSON.stringify({
           type: "turn_committed",
@@ -197,6 +280,47 @@ export class BocciaRoom extends DurableObject {
         return;
       }
 
+      const reason = data.reason || "shot_result";
+
+      if (reason === "shot_result") {
+        if (
+          !activeThrow ||
+          activeThrow.playerId !== player.id ||
+          activeThrow.throwId !== data.throwId ||
+          activeThrow.baseRevision !== currentRevision
+        ) {
+          ws.send(JSON.stringify({
+            type: "turn_rejected",
+            revision: currentRevision,
+            commitId: data.commitId,
+            state: currentState,
+          }));
+          return;
+        }
+      } else if (reason === "decline") {
+        const expected = this.expectedSide(currentState);
+        if (activeThrow || (expected && expected !== player.side)) {
+          ws.send(JSON.stringify({
+            type: "turn_rejected",
+            revision: currentRevision,
+            commitId: data.commitId,
+            state: currentState,
+          }));
+          return;
+        }
+      } else if (reason === "state_transition") {
+        // Automatic end / tiebreak transition. There must be no live throw.
+        if (activeThrow) {
+          ws.send(JSON.stringify({
+            type: "turn_rejected",
+            revision: currentRevision,
+            commitId: data.commitId,
+            state: currentState,
+          }));
+          return;
+        }
+      }
+
       const nextRevision = currentRevision + 1;
       const committedState = {
         ...data.state,
@@ -206,14 +330,14 @@ export class BocciaRoom extends DurableObject {
       await this.ctx.storage.put("gameState", committedState);
       await this.ctx.storage.put("turnRevision", nextRevision);
       await this.ctx.storage.put("lastCommitId", data.commitId);
+      if (activeThrow) await this.ctx.storage.delete("activeThrow");
 
-      // IMPORTANT: broadcast to BOTH players, including the thrower.
-      // Nobody advances to the next playable turn until this arrives.
+      // This is the ONLY packet that advances a turn.
       this.broadcast({
         type: "turn_committed",
         revision: nextRevision,
         commitId: data.commitId,
-        reason: data.reason || "shot_result",
+        reason,
         playerId: player.id,
         side: player.side,
         state: committedState,
@@ -221,23 +345,15 @@ export class BocciaRoom extends DurableObject {
       return;
     }
 
-    if (data.type === "shot_result" && data.state) {
-      // Backward compatibility only. New clients use turn_commit.
-      await this.ctx.storage.put("gameState", data.state);
-      await this.ctx.storage.put(
-        "turnRevision",
-        Number(data.state.turnRevision) || 0
-      );
-    }
-
-    if (
-      ["throw", "shot_result", "sync_state", "restart", "decline"]
-        .includes(data.type)
-    ) {
+    if (data.type === "restart") {
+      await this.ctx.storage.delete("gameState");
+      await this.ctx.storage.delete("turnRevision");
+      await this.ctx.storage.delete("lastCommitId");
+      await this.ctx.storage.delete("activeThrow");
       this.broadcast({
-        ...data,
-        side: player.side,
+        type: "restart",
         playerId: player.id,
+        side: player.side,
       });
       return;
     }
@@ -248,6 +364,7 @@ export class BocciaRoom extends DurableObject {
         JSON.stringify({
           type: "state_reply",
           revision: Number((await this.ctx.storage.get("turnRevision")) || 0),
+          activeThrow: (await this.ctx.storage.get("activeThrow")) || null,
           state: savedState || null,
         })
       );
@@ -297,7 +414,27 @@ export class BocciaRoom extends DurableObject {
   }
 
   async webSocketClose(ws) {
+    const player = this.sessions.get(ws) || ws.deserializeAttachment();
     this.sessions.delete(ws);
+
+    const activeThrow =
+      (await this.ctx.storage.get("activeThrow")) || null;
+
+    if (player && activeThrow?.playerId === player.id) {
+      await this.ctx.storage.delete("activeThrow");
+      const state = (await this.ctx.storage.get("gameState")) || null;
+      const revision = Number(
+        (await this.ctx.storage.get("turnRevision")) || 0
+      );
+
+      this.broadcast({
+        type: "throw_cancelled",
+        revision,
+        state,
+        playerId: player.id,
+      });
+    }
+
     this.broadcastRoomState();
     await this.scheduleCleanupIfEmpty();
   }
