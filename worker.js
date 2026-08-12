@@ -147,12 +147,91 @@ export class BocciaRoom extends DurableObject {
       return;
     }
 
+    if (data.type === "game_start" && data.state) {
+      const initialRevision = Math.max(1, Number(data.state.turnRevision) || 1);
+      const initialState = { ...data.state, turnRevision: initialRevision };
+      await this.ctx.storage.put("gameState", initialState);
+      await this.ctx.storage.put("turnRevision", initialRevision);
+
+      this.broadcast({
+        ...data,
+        state: initialState,
+        side: player.side,
+        playerId: player.id,
+      });
+      return;
+    }
+
+    if (data.type === "turn_commit" && data.state && data.commitId) {
+      const currentRevision = Number(
+        (await this.ctx.storage.get("turnRevision")) || 0
+      );
+      const currentState =
+        (await this.ctx.storage.get("gameState")) || null;
+      const lastCommitId =
+        (await this.ctx.storage.get("lastCommitId")) || null;
+
+      // Retry of an already accepted commit: acknowledge it again,
+      // but never advance the revision twice.
+      if (lastCommitId === data.commitId) {
+        ws.send(JSON.stringify({
+          type: "turn_committed",
+          revision: currentRevision,
+          commitId: data.commitId,
+          reason: data.reason || "shot_result",
+          playerId: player.id,
+          side: player.side,
+          state: currentState,
+        }));
+        return;
+      }
+
+      const baseRevision = Number(data.baseRevision) || 0;
+      if (baseRevision !== currentRevision) {
+        ws.send(JSON.stringify({
+          type: "turn_rejected",
+          revision: currentRevision,
+          commitId: data.commitId,
+          state: currentState,
+        }));
+        return;
+      }
+
+      const nextRevision = currentRevision + 1;
+      const committedState = {
+        ...data.state,
+        turnRevision: nextRevision,
+      };
+
+      await this.ctx.storage.put("gameState", committedState);
+      await this.ctx.storage.put("turnRevision", nextRevision);
+      await this.ctx.storage.put("lastCommitId", data.commitId);
+
+      // IMPORTANT: broadcast to BOTH players, including the thrower.
+      // Nobody advances to the next playable turn until this arrives.
+      this.broadcast({
+        type: "turn_committed",
+        revision: nextRevision,
+        commitId: data.commitId,
+        reason: data.reason || "shot_result",
+        playerId: player.id,
+        side: player.side,
+        state: committedState,
+      });
+      return;
+    }
+
     if (data.type === "shot_result" && data.state) {
+      // Backward compatibility only. New clients use turn_commit.
       await this.ctx.storage.put("gameState", data.state);
+      await this.ctx.storage.put(
+        "turnRevision",
+        Number(data.state.turnRevision) || 0
+      );
     }
 
     if (
-      ["throw", "shot_result", "sync_state", "restart", "decline", "game_start"]
+      ["throw", "shot_result", "sync_state", "restart", "decline"]
         .includes(data.type)
     ) {
       this.broadcast({
@@ -168,6 +247,7 @@ export class BocciaRoom extends DurableObject {
       ws.send(
         JSON.stringify({
           type: "state_reply",
+          revision: Number((await this.ctx.storage.get("turnRevision")) || 0),
           state: savedState || null,
         })
       );
