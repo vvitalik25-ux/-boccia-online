@@ -7,7 +7,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/" || url.pathname === "/health") {
-      return new Response("Boccia Online — server OK", {
+      return new Response("Boccia SERVER-TRUTH — OK", {
         headers: { "Content-Type": "text/plain; charset=utf-8" },
       });
     }
@@ -34,8 +34,7 @@ export default {
       }
 
       const id = env.BOCCIA_ROOMS.idFromName(roomCode);
-      const room = env.BOCCIA_ROOMS.get(id);
-      return room.fetch(request);
+      return env.BOCCIA_ROOMS.get(id).fetch(request);
     }
 
     return new Response("Not found", { status: 404 });
@@ -57,15 +56,7 @@ export class BocciaRoom extends DurableObject {
     );
   }
 
-  expectedSide(state) {
-    const phase = state?.phase;
-    if (phase === "jackRed" || phase === "red") return "red";
-    if (phase === "jackBlue" || phase === "blue") return "blue";
-    return null;
-  }
-
   async fetch() {
-    // A player is connecting/reconnecting, so keep this room alive.
     await this.ctx.storage.deleteAlarm();
 
     const pair = new WebSocketPair();
@@ -75,6 +66,7 @@ export class BocciaRoom extends DurableObject {
 
     const player = {
       id: crypto.randomUUID(),
+      clientKey: null,
       side: null,
       ready: false,
     };
@@ -88,9 +80,56 @@ export class BocciaRoom extends DurableObject {
     });
   }
 
+  async getRevision() {
+    return Number((await this.ctx.storage.get("revision")) || 0);
+  }
+
+  async getState() {
+    return (await this.ctx.storage.get("gameState")) || null;
+  }
+
+  connectedPlayers() {
+    return [...this.sessions.values()]
+      .filter((p) => p.side)
+      .map((p) => ({
+        id: p.id,
+        side: p.side,
+        ready: !!p.ready,
+      }));
+  }
+
+  async snapshotPayload(type = "snapshot", extra = {}) {
+    return {
+      type,
+      revision: await this.getRevision(),
+      state: await this.getState(),
+      players: this.connectedPlayers(),
+      ...extra,
+    };
+  }
+
+  expectedSide(state) {
+    const phase = state?.phase;
+    if (phase === "jackRed" || phase === "red") return "red";
+    if (phase === "jackBlue" || phase === "blue") return "blue";
+    return null;
+  }
+
+  async getSeats() {
+    return (
+      (await this.ctx.storage.get("seats")) || {
+        red: null,
+        blue: null,
+      }
+    );
+  }
+
+  async saveSeats(seats) {
+    await this.ctx.storage.put("seats", seats);
+  }
+
   async webSocketMessage(ws, message) {
     let data;
-
     try {
       data = JSON.parse(message);
     } catch {
@@ -102,40 +141,70 @@ export class BocciaRoom extends DurableObject {
       this.sessions.get(ws) ||
       ws.deserializeAttachment() || {
         id: crypto.randomUUID(),
+        clientKey: null,
         side: null,
         ready: false,
       };
 
     if (data.type === "join") {
-      const occupied = new Set(
-        [...this.sessions.values()]
-          .filter((p) => p.id !== player.id && p.side)
-          .map((p) => p.side)
-      );
+      await this.ctx.storage.deleteAlarm();
 
-      if (!player.side) {
-        if (!occupied.has("red")) player.side = "red";
-        else if (!occupied.has("blue")) player.side = "blue";
-        else {
+      const clientKey = String(data.clientKey || player.id).slice(0, 160);
+      const seats = await this.getSeats();
+
+      let side = null;
+      if (seats.red?.clientKey === clientKey) side = "red";
+      if (seats.blue?.clientKey === clientKey) side = "blue";
+
+      // Replace a stale socket from the same browser/tab.
+      for (const [otherWs, other] of this.sessions.entries()) {
+        if (otherWs === ws) continue;
+        if (other.clientKey && other.clientKey === clientKey) {
+          this.sessions.delete(otherWs);
+          try {
+            otherWs.close(1012, "reconnected");
+          } catch {}
+        }
+      }
+
+      if (!side) {
+        if (!seats.red) {
+          side = "red";
+          seats.red = { clientKey, ready: false };
+        } else if (!seats.blue) {
+          side = "blue";
+          seats.blue = { clientKey, ready: false };
+        } else {
           ws.send(JSON.stringify({ type: "room_full" }));
           return;
         }
       }
 
-      player.ready = false;
+      const seat = seats[side] || { clientKey, ready: false };
+      player = {
+        id: player.id || crypto.randomUUID(),
+        clientKey,
+        side,
+        ready: !!seat.ready,
+      };
+
+      seats[side] = {
+        clientKey,
+        ready: player.ready,
+      };
+
+      await this.saveSeats(seats);
       ws.serializeAttachment(player);
       this.sessions.set(ws, player);
-
-      const savedState = await this.ctx.storage.get("gameState");
 
       ws.send(
         JSON.stringify({
           type: "joined",
           playerId: player.id,
           side: player.side,
-          revision: Number((await this.ctx.storage.get("turnRevision")) || 0),
-          activeThrow: (await this.ctx.storage.get("activeThrow")) || null,
-          state: savedState || null,
+          ready: player.ready,
+          revision: await this.getRevision(),
+          state: await this.getState(),
         })
       );
 
@@ -152,192 +221,142 @@ export class BocciaRoom extends DurableObject {
       player.ready = !!data.ready;
       ws.serializeAttachment(player);
       this.sessions.set(ws, player);
+
+      const seats = await this.getSeats();
+      if (seats[player.side]?.clientKey === player.clientKey) {
+        seats[player.side].ready = player.ready;
+        await this.saveSeats(seats);
+      }
+
       this.broadcastRoomState();
       return;
     }
 
-    if (data.type === "game_start" && data.state) {
-      // Only red starts a fresh room. Duplicate starts are harmless.
-      const existingState = await this.ctx.storage.get("gameState");
-      const existingRevision = Number(
-        (await this.ctx.storage.get("turnRevision")) || 0
-      );
+    if (data.type === "sync_request") {
+      ws.send(JSON.stringify(await this.snapshotPayload()));
+      return;
+    }
 
-      if (existingState) {
-        ws.send(JSON.stringify({
-          type: "state_reply",
-          revision: existingRevision,
-          state: existingState,
-          activeThrow: (await this.ctx.storage.get("activeThrow")) || null,
-        }));
+    if (data.type === "start_match" && data.state && data.startId) {
+      const currentState = await this.getState();
+      const currentRevision = await this.getRevision();
+
+      // If another retry/client already started it, return the canonical state.
+      if (currentState) {
+        ws.send(
+          JSON.stringify(
+            await this.snapshotPayload("snapshot", {
+              commitId: data.startId,
+            })
+          )
+        );
         return;
       }
 
-      if (player.side !== "red") return;
+      const players = this.connectedPlayers();
+      const red = players.find((p) => p.side === "red");
+      const blue = players.find((p) => p.side === "blue");
 
-      const initialRevision = 1;
-      const initialState = {
+      if (
+        player.side !== "red" ||
+        !red?.ready ||
+        !blue?.ready
+      ) {
+        ws.send(
+          JSON.stringify({
+            type: "start_rejected",
+            revision: currentRevision,
+            state: currentState,
+          })
+        );
+        return;
+      }
+
+      const revision = 1;
+      const committedState = {
         ...data.state,
-        turnRevision: initialRevision,
+        revision,
       };
 
-      await this.ctx.storage.put("gameState", initialState);
-      await this.ctx.storage.put("turnRevision", initialRevision);
-      await this.ctx.storage.delete("activeThrow");
-      await this.ctx.storage.delete("lastCommitId");
+      await this.ctx.storage.put("revision", revision);
+      await this.ctx.storage.put("gameState", committedState);
+      await this.ctx.storage.put("lastCommitId", String(data.startId));
 
+      // Broadcast is fast path. Polling is the fallback path.
       this.broadcast({
-        type: "game_start",
-        state: initialState,
-        revision: initialRevision,
-        side: player.side,
+        type: "state_saved",
+        revision,
+        commitId: data.startId,
         playerId: player.id,
+        side: player.side,
+        state: committedState,
       });
       return;
     }
 
-    if (data.type === "throw") {
-      const currentRevision = Number(
-        (await this.ctx.storage.get("turnRevision")) || 0
-      );
-      const currentState =
-        (await this.ctx.storage.get("gameState")) || null;
-      const activeThrow =
-        (await this.ctx.storage.get("activeThrow")) || null;
-      const expected = this.expectedSide(currentState);
-      const baseRevision = Number(data.baseRevision) || 0;
-
-      if (
-        !data.throwId ||
-        activeThrow ||
-        baseRevision !== currentRevision ||
-        (expected && expected !== player.side)
-      ) {
-        ws.send(JSON.stringify({
-          type: "throw_rejected",
-          revision: currentRevision,
-          state: currentState,
-        }));
-        return;
-      }
-
-      const throwInfo = {
-        throwId: String(data.throwId),
-        playerId: player.id,
-        side: player.side,
-        baseRevision: currentRevision,
-        kind: data.kind || null,
-        startedAt: Date.now(),
-      };
-
-      await this.ctx.storage.put("activeThrow", throwInfo);
-
-      // The opponent receives only "a throw is happening". No coordinates.
-      this.broadcast({
-        type: "throw",
-        throwId: throwInfo.throwId,
-        baseRevision: currentRevision,
-        kind: throwInfo.kind,
-        side: player.side,
-        playerId: player.id,
-      }, ws);
-      return;
-    }
-
-    if (data.type === "turn_commit" && data.state && data.commitId) {
-      const currentRevision = Number(
-        (await this.ctx.storage.get("turnRevision")) || 0
-      );
-      const currentState =
-        (await this.ctx.storage.get("gameState")) || null;
-      const activeThrow =
-        (await this.ctx.storage.get("activeThrow")) || null;
+    if (data.type === "save_state" && data.state && data.commitId) {
+      const currentRevision = await this.getRevision();
+      const currentState = await this.getState();
       const lastCommitId =
         (await this.ctx.storage.get("lastCommitId")) || null;
 
-      // Idempotency: the same commit may be retried any number of times.
+      // Idempotent retry: same save can arrive 100 times and still applies once.
       if (lastCommitId === data.commitId) {
-        ws.send(JSON.stringify({
-          type: "turn_committed",
-          revision: currentRevision,
-          commitId: data.commitId,
-          reason: data.reason || "shot_result",
-          playerId: player.id,
-          side: player.side,
-          state: currentState,
-        }));
+        ws.send(
+          JSON.stringify({
+            type: "state_saved",
+            revision: currentRevision,
+            commitId: data.commitId,
+            playerId: player.id,
+            side: player.side,
+            state: currentState,
+          })
+        );
         return;
       }
 
       const baseRevision = Number(data.baseRevision) || 0;
-      if (baseRevision !== currentRevision) {
-        ws.send(JSON.stringify({
-          type: "turn_rejected",
-          revision: currentRevision,
-          commitId: data.commitId,
-          state: currentState,
-        }));
+
+      if (!currentState || baseRevision !== currentRevision) {
+        ws.send(
+          JSON.stringify({
+            type: "state_conflict",
+            revision: currentRevision,
+            state: currentState,
+          })
+        );
         return;
       }
 
-      const reason = data.reason || "shot_result";
-
-      if (reason === "shot_result") {
-        if (
-          !activeThrow ||
-          activeThrow.playerId !== player.id ||
-          activeThrow.throwId !== data.throwId ||
-          activeThrow.baseRevision !== currentRevision
-        ) {
-          ws.send(JSON.stringify({
-            type: "turn_rejected",
+      // Only the side whose turn exists in the last canonical state can write
+      // the next canonical state. This also covers Jack and end transitions.
+      const expected = this.expectedSide(currentState);
+      if (expected && expected !== player.side) {
+        ws.send(
+          JSON.stringify({
+            type: "state_conflict",
             revision: currentRevision,
-            commitId: data.commitId,
             state: currentState,
-          }));
-          return;
-        }
-      } else if (reason === "decline") {
-        const expected = this.expectedSide(currentState);
-        if (activeThrow || (expected && expected !== player.side)) {
-          ws.send(JSON.stringify({
-            type: "turn_rejected",
-            revision: currentRevision,
-            commitId: data.commitId,
-            state: currentState,
-          }));
-          return;
-        }
-      } else if (reason === "state_transition") {
-        // Automatic end / tiebreak transition. There must be no live throw.
-        if (activeThrow) {
-          ws.send(JSON.stringify({
-            type: "turn_rejected",
-            revision: currentRevision,
-            commitId: data.commitId,
-            state: currentState,
-          }));
-          return;
-        }
+          })
+        );
+        return;
       }
 
       const nextRevision = currentRevision + 1;
       const committedState = {
         ...data.state,
-        turnRevision: nextRevision,
+        revision: nextRevision,
       };
 
+      await this.ctx.storage.put("revision", nextRevision);
       await this.ctx.storage.put("gameState", committedState);
-      await this.ctx.storage.put("turnRevision", nextRevision);
-      await this.ctx.storage.put("lastCommitId", data.commitId);
-      if (activeThrow) await this.ctx.storage.delete("activeThrow");
+      await this.ctx.storage.put("lastCommitId", String(data.commitId));
 
-      // This is the ONLY packet that advances a turn.
+      // The same canonical state goes back to BOTH clients, including sender.
       this.broadcast({
-        type: "turn_committed",
+        type: "state_saved",
         revision: nextRevision,
         commitId: data.commitId,
-        reason,
         playerId: player.id,
         side: player.side,
         state: committedState,
@@ -346,28 +365,63 @@ export class BocciaRoom extends DurableObject {
     }
 
     if (data.type === "restart") {
+      await this.ctx.storage.delete("revision");
       await this.ctx.storage.delete("gameState");
-      await this.ctx.storage.delete("turnRevision");
       await this.ctx.storage.delete("lastCommitId");
-      await this.ctx.storage.delete("activeThrow");
+
+      const seats = await this.getSeats();
+      if (seats.red) seats.red.ready = false;
+      if (seats.blue) seats.blue.ready = false;
+      await this.saveSeats(seats);
+
+      for (const [socket, p] of this.sessions.entries()) {
+        p.ready = false;
+        socket.serializeAttachment(p);
+        this.sessions.set(socket, p);
+      }
+
       this.broadcast({
         type: "restart",
         playerId: player.id,
-        side: player.side,
       });
+      this.broadcastRoomState();
       return;
     }
 
-    if (data.type === "state_request") {
-      const savedState = await this.ctx.storage.get("gameState");
-      ws.send(
-        JSON.stringify({
-          type: "state_reply",
-          revision: Number((await this.ctx.storage.get("turnRevision")) || 0),
-          activeThrow: (await this.ctx.storage.get("activeThrow")) || null,
-          state: savedState || null,
-        })
-      );
+    if (data.type === "leave") {
+      const seats = await this.getSeats();
+      if (
+        player.side &&
+        seats[player.side]?.clientKey === player.clientKey
+      ) {
+        seats[player.side] = null;
+        await this.saveSeats(seats);
+      }
+
+      this.sessions.delete(ws);
+      this.broadcastRoomState();
+      try {
+        ws.close(1000, "leave");
+      } catch {}
+
+      await this.scheduleCleanupIfEmpty();
+      return;
+    }
+  }
+
+  broadcastRoomState() {
+    this.broadcast({
+      type: "room_state",
+      players: this.connectedPlayers(),
+    });
+  }
+
+  broadcast(data) {
+    const message = JSON.stringify(data);
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(message);
+      } catch {}
     }
   }
 
@@ -377,64 +431,8 @@ export class BocciaRoom extends DurableObject {
     }
   }
 
-  async alarm() {
-    // If nobody came back within 30 minutes, erase the whole room state.
-    if (this.ctx.getWebSockets().length === 0) {
-      await this.ctx.storage.deleteAll();
-      this.sessions.clear();
-      return;
-    }
-
-    await this.ctx.storage.deleteAlarm();
-  }
-
-  broadcastRoomState() {
-    const players = [...this.sessions.values()]
-      .filter((p) => p.side)
-      .map((p) => ({
-        id: p.id,
-        side: p.side,
-        ready: !!p.ready,
-      }));
-
-    this.broadcast({
-      type: "room_state",
-      players,
-    });
-  }
-
-  broadcast(data) {
-    const message = JSON.stringify(data);
-
-    for (const ws of this.ctx.getWebSockets()) {
-      try {
-        ws.send(message);
-      } catch {}
-    }
-  }
-
   async webSocketClose(ws) {
-    const player = this.sessions.get(ws) || ws.deserializeAttachment();
     this.sessions.delete(ws);
-
-    const activeThrow =
-      (await this.ctx.storage.get("activeThrow")) || null;
-
-    if (player && activeThrow?.playerId === player.id) {
-      await this.ctx.storage.delete("activeThrow");
-      const state = (await this.ctx.storage.get("gameState")) || null;
-      const revision = Number(
-        (await this.ctx.storage.get("turnRevision")) || 0
-      );
-
-      this.broadcast({
-        type: "throw_cancelled",
-        revision,
-        state,
-        playerId: player.id,
-      });
-    }
-
     this.broadcastRoomState();
     await this.scheduleCleanupIfEmpty();
   }
@@ -443,5 +441,15 @@ export class BocciaRoom extends DurableObject {
     this.sessions.delete(ws);
     this.broadcastRoomState();
     await this.scheduleCleanupIfEmpty();
+  }
+
+  async alarm() {
+    if (this.ctx.getWebSockets().length === 0) {
+      await this.ctx.storage.deleteAll();
+      this.sessions.clear();
+      return;
+    }
+
+    await this.ctx.storage.deleteAlarm();
   }
 }
