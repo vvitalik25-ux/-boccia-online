@@ -187,6 +187,23 @@ function fromSim(o){
     realism:o.realism?clone(o.realism):null
   };
 }
+function captureAnimationFrame(jack,balls){
+  return{
+    jack:jack?fromSim(jack):null,
+    balls:(balls||[]).map(fromSim)
+  };
+}
+function downsampleAnimationFrames(frames,maxFrames=72){
+  if(frames.length<=maxFrames)return frames;
+  const out=[];
+  for(let i=0;i<maxFrames;i++){
+    const idx=Math.round(i*(frames.length-1)/(maxFrames-1));
+    const frame=frames[idx];
+    if(!out.length||frame!==out[out.length-1])out.push(frame);
+  }
+  return out;
+}
+
 function speedFromPower(power){
   const min=4.3,max=Math.sqrt(2*BALL_TYPE_MAP.medium.decel*C.h*.96)*1.12;
   return min+(max-min)*clamp(power,.08,1);
@@ -270,6 +287,9 @@ function resolve3DBallContact(a,b){
 }
 function simulateThrow(s,shot){
   let jack=toSim(s.jack),balls=(s.balls||[]).map(toSim);
+  const animationFrames=[];
+  const events=[];
+  let jackKnockedOut=false;
   const pos=launcherPointForBox(s,shot.box),a=shot.angle*Math.PI/180,speed=speedFromPower(shot.power);
   const launch=applyRealismToLaunch(s.realisticMode,Math.sin(a)*speed,-Math.cos(a)*speed,shot.kind==="jack"?"jack":shot.side,shot.hardnessId);
   const moving={
@@ -280,6 +300,8 @@ function simulateThrow(s,shot){
   if(moving.realism)moving.realism.startSpeed=Math.hypot(moving.vx,moving.vy);
   if(shot.kind==="jack")jack=moving;else balls.push(moving);
   let jackFouled=false,settle=0;
+
+  animationFrames.push(captureAnimationFrame(jack,balls));
 
   for(let step=0;step<1500;step++){
     const objs=jack?[jack,...balls]:[...balls];
@@ -313,9 +335,28 @@ function simulateThrow(s,shot){
       const out=b.x-b.r<=0||b.x+b.r>=C.w||b.y-b.r<=0||b.y+b.r>=C.h;if(!out)continue;
       b.vx=b.vy=0;
       if(b.kind==="jack"){
-        if(b._shot&&shot.kind==="jack"){jackFouled=true;jack=null}else{jack=null;s.jackNeedsCross=true}
-      }else{const idx=balls.indexOf(b);if(idx>=0)balls.splice(idx,1)}
+        if(b._shot&&shot.kind==="jack"){
+          jackFouled=true;
+          events.push({type:"jack_out",text:"Джек — аут"});
+          jack=null;
+        }else{
+          jack=null;
+          jackKnockedOut=true;
+          s.jackNeedsCross=true;
+          events.push({type:"jack_out",text:"Джек выбит за пределы площадки"});
+        }
+      }else{
+        events.push({
+          type:"ball_out",
+          side:b.side,
+          text:`${b.side==="red"?"Красный":"Синий"} мяч — аут`
+        });
+        const idx=balls.indexOf(b);if(idx>=0)balls.splice(idx,1);
+      }
     }
+
+    if(step%4===0)animationFrames.push(captureAnimationFrame(jack,balls));
+
     const all=jack?[jack,...balls]:[...balls];
     const any=all.some(b=>Math.hypot(b.vx,b.vy)>.06||Math.abs(b.vz||0)>.05);
     if(!any)settle++;else settle=0;if(settle>13)break;
@@ -323,10 +364,34 @@ function simulateThrow(s,shot){
 
   const shotBall=shot.kind==="jack"?(jack&&jack._shot?jack:null):(balls.find(b=>b._shot)||null);
   if(shotBall&&!shotBall.entered){
-    if(shot.kind==="jack"){jackFouled=true;jack=null}else{const idx=balls.indexOf(shotBall);if(idx>=0)balls.splice(idx,1)}
+    if(shot.kind==="jack"){
+      jackFouled=true;
+      events.push({type:"jack_not_entered",text:"Джек не вошёл в игровую зону"});
+      jack=null;
+    }else{
+      events.push({
+        type:"ball_not_entered",
+        side:shot.side,
+        text:`${shot.side==="red"?"Красный":"Синий"} мяч не вошёл в игровую зону`
+      });
+      const idx=balls.indexOf(shotBall);if(idx>=0)balls.splice(idx,1);
+    }
   }
+
   for(const b of balls)delete b._shot;if(jack)delete jack._shot;
-  s.jack=fromSim(jack);s.balls=balls.map(fromSim);return{jackFouled};
+  s.jack=fromSim(jack);s.balls=balls.map(fromSim);
+
+  animationFrames.push(captureAnimationFrame(jack,balls));
+
+  return{
+    jackFouled,
+    jackKnockedOut,
+    events,
+    animation:{
+      frameMs:27,
+      frames:downsampleAnimationFrames(animationFrames,72)
+    }
+  };
 }
 function jackCrossPlacementPoint(s){
   const p=crossPoint(),balls=(s.balls||[]).map(toSim),blockers=balls.filter(b=>Math.hypot(b.x-p.x,b.y-p.y)<BALL_R+b.r);
@@ -383,22 +448,103 @@ function startTieBreak(s,first){
 function finishMatch(s,winner,tb){
   s.phase="finished";s.modal={title:`${winner==="red"?"Красные":"Синие"} победили! 🏆`,text:tb?`Основной матч ${s.redScore}:${s.blueScore}. Победитель определён в тай-брейке.`:`Финальный счёт ${s.redScore}:${s.blueScore}.`};
 }
-function finishEnd(s){
+function finishEnd(s,events=[]){
+  const endedEnd=s.endNo;
   const pts=scoreCurrentEnd(s);
-  if(s.tieBreak){if(pts.red===pts.blue)startTieBreak(s,s.tieFirst==="red"?"blue":"red");else finishMatch(s,pts.red>pts.blue?"red":"blue",true);return}
-  s.redScore+=pts.red;s.blueScore+=pts.blue;
-  if(s.endNo>=s.totalEnds){if(s.redScore===s.blueScore)startTieBreak(s,Math.random()<.5?"red":"blue");else finishMatch(s,s.redScore>s.blueScore?"red":"blue",false)}
-  else{s.endNo++;startRegulationEnd(s)}
+
+  if(s.tieBreak){
+    if(pts.red===pts.blue){
+      startTieBreak(s,s.tieFirst==="red"?"blue":"red");
+      events.push({
+        type:"tiebreak",
+        text:"Тай-брейк завершился вничью · ещё один дополнительный энд"
+      });
+    }else{
+      finishMatch(s,pts.red>pts.blue?"red":"blue",true);
+    }
+    return;
+  }
+
+  s.redScore+=pts.red;
+  s.blueScore+=pts.blue;
+
+  let matchFinished=false;
+  let nextEnd=endedEnd;
+
+  if(s.endNo>=s.totalEnds){
+    if(s.redScore===s.blueScore){
+      startTieBreak(s,Math.random()<.5?"red":"blue");
+      events.push({
+        type:"tiebreak",
+        text:`Основной матч ${s.redScore}:${s.blueScore} · начинается тай-брейк`
+      });
+    }else{
+      finishMatch(s,s.redScore>s.blueScore?"red":"blue",false);
+      matchFinished=true;
+    }
+  }else{
+    s.endNo++;
+    nextEnd=s.endNo;
+    startRegulationEnd(s);
+  }
+
+  events.push({
+    type:"end",
+    endedEnd,
+    redPoints:pts.red,
+    bluePoints:pts.blue,
+    redScore:s.redScore,
+    blueScore:s.blueScore,
+    nextEnd,
+    matchFinished
+  });
 }
-function resolveJackThrow(s,side,fouled){
+function resolveJackThrow(s,side,fouled,events=[]){
   const j=toSim(s.jack);
-  if(fouled||!j||!isJackValidSim(j)){s.jack=null;s.currentJackBox=nextJackBoxAfter(s,s.currentJackBox);const next=sideForBox(s,s.currentJackBox);s.activePlayerBox[next]=s.currentJackBox;s.phase=sidePhase(next,"jack");return}
-  s.firstColourLockedBox[side]=s.currentJackBox;s.activePlayerBox[side]=s.currentJackBox;s.phase=side;ensureSelectedBall(s,side);
+  if(fouled||!j||!isJackValidSim(j)){
+    s.jack=null;
+    s.currentJackBox=nextJackBoxAfter(s,s.currentJackBox);
+    const next=sideForBox(s,s.currentJackBox);
+    s.activePlayerBox[next]=s.currentJackBox;
+    s.phase=sidePhase(next,"jack");
+
+    if(!events.some(ev=>ev.type==="jack_out"||ev.type==="jack_not_entered")){
+      events.push({
+        type:"invalid_jack",
+        nextBox:s.currentJackBox,
+        text:`Недействительный джек · следующий бокс ${s.currentJackBox}`
+      });
+    }
+    return;
+  }
+  s.firstColourLockedBox[side]=s.currentJackBox;
+  s.activePlayerBox[side]=s.currentJackBox;
+  s.phase=side;
+  ensureSelectedBall(s,side);
 }
-function resolveColourThrow(s){
-  const j=toSim(s.jack);if(s.jackNeedsCross||!j||!isJackValidSim(j))placeJackOnCross(s);
-  if(s.redLeft<=0&&s.blueLeft<=0){finishEnd(s);return}
-  const next=sideToPlay(s);if(!next){finishEnd(s);return}s.phase=next;ensureActivePlayer(s,next);ensureSelectedBall(s,next);
+function resolveColourThrow(s,events=[]){
+  const j=toSim(s.jack);
+  if(s.jackNeedsCross||!j||!isJackValidSim(j)){
+    placeJackOnCross(s);
+    if(!events.some(ev=>ev.type==="jack_cross")){
+      events.push({type:"jack_cross",text:"Джек установлен на крест"});
+    }
+  }
+
+  if(s.redLeft<=0&&s.blueLeft<=0){
+    finishEnd(s,events);
+    return;
+  }
+
+  const next=sideToPlay(s);
+  if(!next){
+    finishEnd(s,events);
+    return;
+  }
+
+  s.phase=next;
+  ensureActivePlayer(s,next);
+  ensureSelectedBall(s,next);
 }
 function applyThrow(s,side,data){
   if(currentSide(s)!==side)throw new Error("Сейчас ход другого игрока");
@@ -413,8 +559,19 @@ function applyThrow(s,side,data){
     setBallsLeft(s,side,ballsLeft(s,side)-1);s.lastColourSide=side;if(s.firstColourLockedBox[side])s.firstColourLockedBox[side]=null;
   }
   const result=simulateThrow(s,{side,kind,box,hardnessId:hardness,angle,power});
-  if(kind==="jack")resolveJackThrow(s,side,result.jackFouled);else resolveColourThrow(s);
-  return s;
+  const events=result.events||[];
+
+  if(kind==="jack"){
+    resolveJackThrow(s,side,result.jackFouled,events);
+  }else{
+    resolveColourThrow(s,events);
+  }
+
+  return{
+    state:s,
+    animation:result.animation,
+    events
+  };
 }
 function applySelectPlayer(s,side,data){
   if(currentSide(s)!==side||s.phase!==side)throw new Error("Сейчас нельзя менять спортсмена");
@@ -436,11 +593,20 @@ function applyLauncher(s,side,data){
   const mu=BALL_R/BW,mv=BALL_R/(my(12.5)-throwingY());
   s.launcherPositions[box]={u:clamp(data.u,mu,1-mu),v:clamp(data.v,mv,1-mv)};return s;
 }
-function applyDecline(s,side){
+function applyDecline(s,side,events=[]){
   if(currentSide(s)!==side||s.phase!==side)throw new Error("Сейчас нельзя отказаться от мячей");
   if(ballsLeft(s,side)<=0)throw new Error("Мячей уже не осталось");
-  for(const item of s.ballInventory[side])item.used=true;setBallsLeft(s,side,0);
-  const other=opponent(side);if(ballsLeft(s,other)>0){s.phase=other;ensureActivePlayer(s,other);ensureSelectedBall(s,other)}else finishEnd(s);
+  for(const item of s.ballInventory[side])item.used=true;
+  setBallsLeft(s,side,0);
+
+  const other=opponent(side);
+  if(ballsLeft(s,other)>0){
+    s.phase=other;
+    ensureActivePlayer(s,other);
+    ensureSelectedBall(s,other);
+  }else{
+    finishEnd(s,events);
+  }
   return s;
 }
 function makeRoomCode(){let out="";for(let i=0;i<5;i++)out+=ROOM_CHARS[Math.floor(Math.random()*ROOM_CHARS.length)];return out}
@@ -551,12 +717,20 @@ export class BocciaRoom extends DurableObject {
     const state=await this.getState();
     if(!state){ws.send(JSON.stringify({type:"action_error",message:"Матч ещё не запущен",ackActionId:actionId,revision:await this.getRevision(),state:null}));return}
     let next=clone(state);
+    let animation=null;
+    let events=[];
+
     try{
-      if(data.type==="throw")next=applyThrow(next,player.side,data);
+      if(data.type==="throw"){
+        const result=applyThrow(next,player.side,data);
+        next=result.state;
+        animation=result.animation||null;
+        events=result.events||[];
+      }
       else if(data.type==="select_player")next=applySelectPlayer(next,player.side,data);
       else if(data.type==="select_ball")next=applySelectBall(next,player.side,data);
       else if(data.type==="set_launcher")next=applyLauncher(next,player.side,data);
-      else if(data.type==="decline")next=applyDecline(next,player.side);
+      else if(data.type==="decline")next=applyDecline(next,player.side,events);
       else throw new Error("Неизвестное действие");
     }catch(err){
       await this.rememberAction(actionId);
@@ -565,7 +739,13 @@ export class BocciaRoom extends DurableObject {
     }
     const revision=(await this.getRevision())+1;next.revision=revision;
     await this.ctx.storage.put("revision",revision);await this.ctx.storage.put("gameState",next);await this.rememberAction(actionId);
-    await this.broadcast(await this.snapshotPayload({ackActionId:actionId,action:data.type,actor:player.side}));
+    await this.broadcast(await this.snapshotPayload({
+      ackActionId:actionId,
+      action:data.type,
+      actor:player.side,
+      animation,
+      events
+    }));
   }
   async webSocketMessage(ws,message){
     let data;try{data=JSON.parse(message)}catch{return}
