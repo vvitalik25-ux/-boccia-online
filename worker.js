@@ -1,5 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 
+const APP_BUILD = "2026-08-17-cache-safe-1";
+const ONLINE_PROTOCOL = "exact-1v1-v4";
+
 const EMPTY_ROOM_TTL_MS = 30 * 60 * 1000;
 const ROOM_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 let C = { x: 0, y: 0, w: 288, h: 600 };
@@ -46,10 +49,14 @@ function cors(headers={}) {
     ...headers
   };
 }
-function json(data,status=200){
+function json(data,status=200,extraHeaders={}){
   return new Response(JSON.stringify(data),{
     status,
-    headers:cors({"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store"})
+    headers:cors({
+      "Content-Type":"application/json; charset=utf-8",
+      "Cache-Control":"no-store",
+      ...extraHeaders
+    })
   });
 }
 function clone(v){return v==null?v:JSON.parse(JSON.stringify(v))}
@@ -665,7 +672,26 @@ export default {
   async fetch(request,env){
     const url=new URL(request.url);
     if(request.method==="OPTIONS")return new Response(null,{status:204,headers:cors()});
-    if(url.pathname==="/"||url.pathname==="/health")return new Response("Boccia exact-1v1-v4 — OK",{headers:cors({"Content-Type":"text/plain; charset=utf-8"})});
+    if(url.pathname==="/version"){
+      return json({
+        build:APP_BUILD,
+        protocol:ONLINE_PROTOCOL,
+        now:Date.now()
+      },200,{
+        "Cache-Control":"no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma":"no-cache",
+        "Expires":"0"
+      });
+    }
+
+    if(url.pathname==="/"||url.pathname==="/health"){
+      return new Response(`Boccia ${ONLINE_PROTOCOL} · ${APP_BUILD} — OK`,{
+        headers:cors({
+          "Content-Type":"text/plain; charset=utf-8",
+          "Cache-Control":"no-store, no-cache, must-revalidate, max-age=0"
+        })
+      });
+    }
 
     if(url.pathname==="/create-room"){
       if(!env.BOCCIA_ROOMS)return json({error:"BOCCIA_ROOMS binding missing"},500);
@@ -687,7 +713,7 @@ export default {
       for(let attempt=0;attempt<12;attempt++){
         const code=makeRoomCode(),id=env.BOCCIA_ROOMS.idFromName(code),stub=env.BOCCIA_ROOMS.get(id);
         const init=await stub.fetch(new Request("https://room.internal/init",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code,clientKey,config})}));
-        if(init.status===201)return json({code,config},201);
+        if(init.status===201)return json({code,config,build:APP_BUILD,protocol:ONLINE_PROTOCOL},201);
         if(init.status!==409)return json({error:"Could not create room"},500);
       }
       return json({error:"Could not allocate room code"},503);
@@ -697,7 +723,7 @@ export default {
       const code=url.pathname.split("/")[2]?.toUpperCase().replace(/[^A-Z0-9]/g,"");
       if(!code||code.length<4||code.length>8)return json({exists:false},404);
       const stub=env.BOCCIA_ROOMS.get(env.BOCCIA_ROOMS.idFromName(code)),r=await stub.fetch("https://room.internal/exists");
-      return r.status===200?json({exists:true}):json({exists:false},404);
+      return r.status===200?json({exists:true,build:APP_BUILD,protocol:ONLINE_PROTOCOL}):json({exists:false,build:APP_BUILD,protocol:ONLINE_PROTOCOL},404);
     }
 
     if(url.pathname.startsWith("/room/")){
@@ -762,8 +788,8 @@ export class BocciaRoom extends DurableObject {
     }
     return result;
   }
-  async roomStatePayload(extra={}){return{type:"room_state",protocol:"exact-1v1-v4",players:await this.playerList(),config:await this.getConfig(),...extra}}
-  async snapshotPayload(extra={}){return{type:"snapshot",protocol:"exact-1v1-v4",revision:await this.getRevision(),state:await this.getState(),players:await this.playerList(),config:await this.getConfig(),...extra}}
+  async roomStatePayload(extra={}){return{type:"room_state",protocol:ONLINE_PROTOCOL,build:APP_BUILD,players:await this.playerList(),config:await this.getConfig(),...extra}}
+  async snapshotPayload(extra={}){return{type:"snapshot",protocol:ONLINE_PROTOCOL,build:APP_BUILD,revision:await this.getRevision(),state:await this.getState(),players:await this.playerList(),config:await this.getConfig(),...extra}}
   async broadcast(data){const msg=JSON.stringify(data);for(const ws of this.ctx.getWebSockets())try{ws.send(msg)}catch{}}
   async broadcastRoomState(extra={}){await this.broadcast(await this.roomStatePayload(extra))}
   async sendSnapshot(ws,extra={}){try{ws.send(JSON.stringify(await this.snapshotPayload(extra)))}catch{}}
@@ -784,7 +810,7 @@ export class BocciaRoom extends DurableObject {
     const actionId=String(data.actionId||"");if(!actionId)return;
     if(await this.processed(actionId)){await this.sendSnapshot(ws,{ackActionId:actionId});return}
     const state=await this.getState();
-    if(!state){ws.send(JSON.stringify({type:"action_error",protocol:"exact-1v1-v4",message:"Матч ещё не запущен",ackActionId:actionId,revision:await this.getRevision(),state:null}));return}
+    if(!state){ws.send(JSON.stringify({type:"action_error",protocol:ONLINE_PROTOCOL,build:APP_BUILD,message:"Матч ещё не запущен",ackActionId:actionId,revision:await this.getRevision(),state:null}));return}
     let next=clone(state);
     let animation=null;
     let events=[];
@@ -812,7 +838,7 @@ export class BocciaRoom extends DurableObject {
       else throw new Error("Неизвестное действие");
     }catch(err){
       await this.rememberAction(actionId);
-      ws.send(JSON.stringify({type:"action_error",protocol:"exact-1v1-v4",message:err?.message||"Действие отклонено",ackActionId:actionId,revision:await this.getRevision(),state}));
+      ws.send(JSON.stringify({type:"action_error",protocol:ONLINE_PROTOCOL,build:APP_BUILD,message:err?.message||"Действие отклонено",ackActionId:actionId,revision:await this.getRevision(),state}));
       return;
     }
     const revision=(await this.getRevision())+1;next.revision=revision;
@@ -835,11 +861,11 @@ export class BocciaRoom extends DurableObject {
       const seats=await this.getSeats();let side=null;
       if(seats.red?.clientKey===clientKey)side="red";else if(seats.blue?.clientKey===clientKey)side="blue";
       else if(!seats.red){side="red";seats.red={clientKey,ready:false}}else if(!seats.blue){side="blue";seats.blue={clientKey,ready:false}}
-      else{ws.send(JSON.stringify({type:"room_full"}));return}
+      else{ws.send(JSON.stringify({type:"room_full",protocol:ONLINE_PROTOCOL,build:APP_BUILD}));return}
       for(const[otherWs,other]of this.sessions.entries())if(otherWs!==ws&&other.clientKey&&other.clientKey===clientKey){this.sessions.delete(otherWs);try{otherWs.close(1012,"reconnected")}catch{}}
       player={id:crypto.randomUUID(),clientKey,side,ready:!!seats[side]?.ready};seats[side]={clientKey,ready:player.ready};
       await this.ctx.storage.put("seats",seats);ws.serializeAttachment(player);this.sessions.set(ws,player);await this.ctx.storage.deleteAlarm();
-      ws.send(JSON.stringify({type:"joined",protocol:"exact-1v1-v4",playerId:player.id,side:player.side,ready:player.ready,revision:await this.getRevision(),state:await this.getState(),players:await this.playerList(),config:await this.getConfig()}));
+      ws.send(JSON.stringify({type:"joined",protocol:ONLINE_PROTOCOL,build:APP_BUILD,playerId:player.id,side:player.side,ready:player.ready,revision:await this.getRevision(),state:await this.getState(),players:await this.playerList(),config:await this.getConfig()}));
       await this.broadcastRoomState();return;
     }
     if(!player.side)return;
@@ -857,7 +883,7 @@ export class BocciaRoom extends DurableObject {
       const actionId=String(data.actionId||"");await this.ctx.storage.delete("gameState");await this.ctx.storage.put("revision",0);await this.ctx.storage.put("processedActions",[]);
       const seats=await this.getSeats();if(seats.red)seats.red.ready=false;if(seats.blue)seats.blue.ready=false;await this.ctx.storage.put("seats",seats);
       for(const[socket,p]of this.sessions.entries()){p.ready=false;socket.serializeAttachment(p);this.sessions.set(socket,p)}
-      await this.broadcast({type:"restart",protocol:"exact-1v1-v4",ackActionId:actionId||null});await this.broadcastRoomState();return;
+      await this.broadcast({type:"restart",protocol:ONLINE_PROTOCOL,build:APP_BUILD,ackActionId:actionId||null});await this.broadcastRoomState();return;
     }
     if(data.type==="leave"){
       const seats=await this.getSeats();if(player.side&&seats[player.side]?.clientKey===player.clientKey){seats[player.side]=null;await this.ctx.storage.put("seats",seats)}
